@@ -24,7 +24,7 @@ def publisher_record_present():
     if not ocsd.STATE.is_file():
         return False
     process = subprocess.check_output(
-        ["/usr/bin/systemctl", "show", "-P", "MainPID", "gen9-t4-ocsd.service"],
+        [ocsd.SYSTEMCTL, "show", "-P", "MainPID", "gen9-t4-ocsd.service"],
         timeout=5).decode("ascii").strip()
     if not process.isdigit() or int(process) <= 0:
         return False

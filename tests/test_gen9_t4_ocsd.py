@@ -20,10 +20,10 @@ def synthetic_snapshot(address):
     header[12] = ocsd.RECORD_SIZE
     struct.pack_into("<I", header, 16, address + 64)
     header[32] = 5
-    header[56] = 2
+    header[56] = 3
     struct.pack_into("<I", header, 60, ocsd.checksum_header(header))
     memory[:64] = header
-    for index, bus in enumerate((2, 3)):
+    for index, bus in enumerate((4, 2, 3)):
         native = bytearray(64)
         native[0] = 1
         native[4] = bus
@@ -43,7 +43,7 @@ class OcsdProtocolTests(unittest.TestCase):
         self.assertEqual(len(self.snapshot), 0x4000)
         ocsd.validate_header(self.snapshot[:64], self.address)
         ocsd.validate_native_headers(self.snapshot)
-        self.assertEqual(self.snapshot[56], 2)
+        self.assertEqual(self.snapshot[56], 3)
         self.assertFalse(any(self.snapshot[ocsd.RECORD_OFFSET:
                                            ocsd.RECORD_OFFSET + ocsd.RECORD_SIZE]))
 
@@ -55,9 +55,9 @@ class OcsdProtocolTests(unittest.TestCase):
 
     def test_header_rejects_corruption(self):
         header = self.snapshot[:64]
-        enabled = ocsd.header_with_count(header, 3)
+        enabled = ocsd.header_with_count(header, 4)
         ocsd.validate_header(enabled, self.address)
-        self.assertEqual(ocsd.header_with_count(enabled, 2), header)
+        self.assertEqual(ocsd.header_with_count(enabled, 3), header)
         corrupt = bytearray(enabled)
         corrupt[16] ^= 1
         with self.assertRaises(ValueError):
@@ -217,7 +217,7 @@ class OcsdProtocolTests(unittest.TestCase):
                 mock.patch.object(ocsd, "gpu_temperature", side_effect=RuntimeError("NVML")), \
                 mock.patch.object(ocsd, "stop_workloads", side_effect=inspect_stop):
             ocsd.claim(memory, self.address)
-        self.assertEqual(observed, [(3, 85, True)])
+        self.assertEqual(observed, [(4, 85, True)])
 
     def test_claim_write_failure_still_requests_workload_stop(self):
         class FailingMemory(bytearray):
@@ -242,7 +242,7 @@ class OcsdProtocolTests(unittest.TestCase):
 
     def test_update_publishes_fail_high_before_failed_status_check(self):
         memory = bytearray(self.snapshot)
-        active = ocsd.header_with_count(memory[:64], 3)
+        active = ocsd.header_with_count(memory[:64], 4)
         memory[:64] = active
         observed = []
 
@@ -262,7 +262,7 @@ class OcsdProtocolTests(unittest.TestCase):
 
     def test_update_counter_wraps_in_synthetic_record(self):
         memory = bytearray(self.snapshot)
-        active = ocsd.header_with_count(memory[:64], 3)
+        active = ocsd.header_with_count(memory[:64], 4)
         memory[:64] = active
         counter, warning = ocsd.publish_and_guard(
             memory, active, 65535, 45, False, False)
@@ -274,7 +274,7 @@ class OcsdProtocolTests(unittest.TestCase):
 
     def test_update_header_mismatch_requests_workload_stop(self):
         memory = bytearray(self.snapshot)
-        active = ocsd.header_with_count(memory[:64], 3)
+        active = ocsd.header_with_count(memory[:64], 4)
         memory[:64] = active
         with mock.patch.object(ocsd, "stop_workloads", return_value=False) as stop:
             with self.assertRaisesRegex(RuntimeError, "header changed"):
@@ -295,7 +295,7 @@ class OcsdProtocolTests(unittest.TestCase):
                     ocsd, "boot_id", return_value="boot-one"):
                 original, active, counter = ocsd.claim(memory, self.address)
                 self.assertEqual(counter, 1)
-                self.assertEqual(memory[56], 3)
+                self.assertEqual(memory[56], 4)
                 original, active, counter = ocsd.claim(memory, self.address)
                 self.assertEqual(counter, 2)
             with mock.patch.object(ocsd, "STATE", state), mock.patch.object(
@@ -345,7 +345,7 @@ class OcsdProtocolTests(unittest.TestCase):
                     ocsd.time, "sleep", return_value=None):
                 with self.assertRaisesRegex(RuntimeError, "retaining OCSD sensor"):
                     ocsd.restore(memory, original, active)
-            self.assertEqual(memory[56], 3)
+            self.assertEqual(memory[56], 4)
             self.assertTrue(ocsd.owned_record(memory[ocsd.RECORD_OFFSET:
                                                       ocsd.RECORD_OFFSET + ocsd.RECORD_SIZE]))
             self.assertTrue(state.exists())
