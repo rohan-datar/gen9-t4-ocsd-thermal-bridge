@@ -16,6 +16,12 @@ Fork of [oceanmedianow/gen9-t4-ocsd-thermal-bridge](https://github.com/oceanmedi
 
 ## Code changes vs upstream
 
+- `OCSD_PUBLISH_OFFSET_C` (default 0): publish the GPU temperature shifted by N
+  degrees so iLO's fan curve engages earlier — the fans never saturated
+  (~47% duty at peak) and the Q3_K_M benchmark case climbed past 78 C at both
+  160 W and 140 W caps. The caution/continuous record thresholds shift equally;
+  the workload-stop (82 C) and restore-cooldown (55 C) guards stay on raw GPU
+  temperatures. Set the ready-check `OCSD_ILO_OFFSET_C` to 15 + N when used.
 - `EXPECTED_PRODUCT`, `GPU_PCI`, `BUS/DEVICE` repinned for the ML350/P100.
 - `NATIVE_BUSES`/`NATIVE_COUNT`/`OWNED_COUNT`/`RECORD_INDEX` introduced;
   all count checks derived from them (upstream hardcoded 2/3).

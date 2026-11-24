@@ -46,6 +46,13 @@ ILO_SENSOR = os.environ.get("OCSD_ILO_SENSOR", "21-PCI 1")
 ILO_OFFSET_C = int(os.environ.get("OCSD_ILO_OFFSET_C", "15"))
 CAUTION_C = 85
 CONTINUOUS_C = 75
+# Publish the GPU temperature shifted by this many degrees so iLO's fan curve
+# engages earlier (the fans have headroom well below saturation). The record's
+# caution/continuous thresholds shift equally to keep the same effective
+# GPU-temperature semantics. 0 preserves upstream behaviour.
+PUBLISH_OFFSET_C = int(os.environ.get("OCSD_PUBLISH_OFFSET_C", "0"))
+CAUTION_PUBLISHED = min(CAUTION_C + PUBLISH_OFFSET_C, 100)
+CONTINUOUS_PUBLISHED = min(CONTINUOUS_C + PUBLISH_OFFSET_C, 100)
 STOP_WORKLOAD_C = 82
 RESTORE_COOL_C = 55
 RESTORE_TIMEOUT_SECONDS = 90
@@ -117,14 +124,19 @@ def make_record(temperature, counter):
     sensor = 64
     record[sensor] = 1
     struct.pack_into("<I", record, sensor + 4, 1)
-    record[sensor + 8], record[sensor + 12] = CAUTION_C, CONTINUOUS_C
+    record[sensor + 8], record[sensor + 12] = CAUTION_PUBLISHED, CONTINUOUS_PUBLISHED
     struct.pack_into("<I", record, sensor + 16, 0x000b0000)
     record[sensor + 20] = temperature
     struct.pack_into("<H", record, sensor + 24, counter)
-    sensor_sum = (1 + 1 + CAUTION_C + CONTINUOUS_C + 0x000b0000
+    sensor_sum = (1 + 1 + CAUTION_PUBLISHED + CONTINUOUS_PUBLISHED + 0x000b0000
                   + temperature + counter + BUS)
     struct.pack_into("<I", record, sensor + 28, (-sensor_sum) & 0xffffffff)
     return bytes(record)
+
+
+def published_temperature(raw):
+    """GPU temperature shifted by the publish offset, capped at the record limit."""
+    return max(0, min(raw + PUBLISH_OFFSET_C, 100))
 
 
 def owned_record(record):
@@ -138,7 +150,7 @@ def owned_record(record):
         return False
     if record[64] != 1 or struct.unpack_from("<I", record, 68)[0] != 1:
         return False
-    if record[72] != CAUTION_C or record[76] != CONTINUOUS_C:
+    if record[72] != CAUTION_PUBLISHED or record[76] != CONTINUOUS_PUBLISHED:
         return False
     if struct.unpack_from("<I", record, 80)[0] != 0x000b0000:
         return False
@@ -244,7 +256,7 @@ def request_thermal_stop(temperature, telemetry_failed, warning_active):
 def publish_and_guard(memory, active_header, counter, temperature,
                       telemetry_failed, warning_active):
     counter = (counter + 1) & 0xffff
-    next_record = make_record(temperature, counter)
+    next_record = make_record(published_temperature(temperature), counter)
     try:
         memory[RECORD_OFFSET:RECORD_OFFSET + RECORD_SIZE] = next_record
         if bytes(memory[RECORD_OFFSET:RECORD_OFFSET + RECORD_SIZE]) != next_record:
@@ -319,7 +331,7 @@ def claim(memory, address):
         telemetry_failed = True
     active_header = header_with_count(original, OWNED_COUNT)
     try:
-        new_record = make_record(temperature, counter)
+        new_record = make_record(published_temperature(temperature), counter)
         memory[RECORD_OFFSET:RECORD_OFFSET + RECORD_SIZE] = new_record
         memory[:64] = active_header
         if (bytes(memory[:64]) != active_header
@@ -365,7 +377,7 @@ def restore(memory, original, active_header):
             LOG.warning("NVIDIA telemetry unavailable during cooldown: %s",
                         type(error).__name__)
         counter = (counter + 1) & 0xffff
-        next_record = make_record(temperature, counter)
+        next_record = make_record(published_temperature(temperature), counter)
         memory[RECORD_OFFSET:RECORD_OFFSET + RECORD_SIZE] = next_record
         if bytes(memory[RECORD_OFFSET:RECORD_OFFSET + RECORD_SIZE]) != next_record:
             raise RuntimeError("OCSD cooldown update readback failed")

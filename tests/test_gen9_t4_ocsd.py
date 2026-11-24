@@ -1,3 +1,5 @@
+import importlib
+import os
 import sys
 from pathlib import Path
 import struct
@@ -32,6 +34,25 @@ def synthetic_snapshot(address):
         offset = 64 + index * ocsd.RECORD_SIZE
         memory[offset:offset + 64] = native
     return bytes(memory)
+
+
+class PublishOffsetTests(unittest.TestCase):
+    def test_offset_shifts_published_temperature_and_thresholds(self):
+        try:
+            with mock.patch.dict(os.environ, {"OCSD_PUBLISH_OFFSET_C": "10"}):
+                importlib.reload(ocsd)
+                self.assertEqual(ocsd.published_temperature(60), 70)
+                self.assertEqual(ocsd.published_temperature(85), 95)
+                self.assertEqual(ocsd.published_temperature(95), 100)  # capped
+                record = ocsd.make_record(70, 5)
+                self.assertEqual(record[84], 70)
+                self.assertEqual(record[72], 95)   # caution 85 + 10
+                self.assertEqual(record[76], 85)   # continuous 75 + 10
+                self.assertTrue(ocsd.owned_record(
+                    ocsd.make_record(ocsd.published_temperature(65), 9)))
+        finally:
+            importlib.reload(ocsd)
+        self.assertEqual(ocsd.PUBLISH_OFFSET_C, 0)
 
 
 class OcsdProtocolTests(unittest.TestCase):
