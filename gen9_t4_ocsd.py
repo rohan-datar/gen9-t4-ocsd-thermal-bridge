@@ -178,7 +178,7 @@ def gpu_temperature():
 def ilo_temperature():
     output = subprocess.check_output(
         [IPMITOOL, "sdr", "get", ILO_SENSOR],
-        stderr=subprocess.DEVNULL, timeout=5).decode("ascii", "replace")
+        stderr=subprocess.DEVNULL, timeout=15).decode("ascii", "replace")
     return parse_ilo_temperature(output)
 
 
@@ -446,7 +446,7 @@ def run():
                     notify("READY=1\nSTATUS=T4 OCSD sensor confirmed in iLO")
                     LOG.info("iLO PCI sensor confirmed; service ready")
                     ready = True
-                if ready and misses >= 2:
+                if ready and misses >= 6:
                     stop_workloads()
                     raise RuntimeError("iLO stopped tracking T4 OCSD temperature")
             notify("WATCHDOG=1")
