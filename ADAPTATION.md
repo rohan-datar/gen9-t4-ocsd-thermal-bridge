@@ -51,3 +51,36 @@ Fork of [oceanmedianow/gen9-t4-ocsd-thermal-bridge](https://github.com/oceanmedi
    native buses observed).
 4. Whether iLO needs the `ilorest` registration reset to discover the
    published sensor.
+
+## NixOS
+
+The flake exports `packages.x86_64-linux.default` (building it runs the offline
+tests) and `nixosModules.default`:
+
+```nix
+# flake.nix inputs
+gen9-t4-ocsd = {
+  url = "github:rohan-datar/gen9-t4-ocsd-thermal-bridge/ml350-p100-publish-offset";
+  inputs.nixpkgs.follows = "nixpkgs";
+};
+
+# host configuration
+imports = [ inputs.gen9-t4-ocsd.nixosModules.default ];
+services.gen9-t4-ocsd = {
+  enable = true;
+  publishOffset = 10; # iLO's reading becomes GPU + 15 + 10
+};
+```
+
+Options: `iloSensor` (default `"27-PCI 3"`), `iloDisplayOffset` (15),
+`publishOffset` (0–15), `workloadUnits` (systemd services to stop on a thermal
+trip; empty means a no-op placeholder for GPU work that is not a host service),
+`nvidiaSmi`, `package`.
+
+The unit is `Type=exec`, not the example's `Type=notify`. READY is sent only
+after iLO confirms the sensor, and after a power cycle iLO registers it only
+after an iLO reset. With `notify`, boot and `nixos-rebuild switch` would hang in
+"activating" and the unit would restart-loop. The daemon pings the watchdog
+from its first loop (`WatchdogSec=60`, sized for the 15 s IPMI timeout), and
+`systemctl status` shows "T4 OCSD sensor confirmed in iLO" once ready.
+
