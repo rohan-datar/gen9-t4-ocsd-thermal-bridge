@@ -40,6 +40,18 @@ PROFILES = {
         "ilo_timeout_s": 5,
         "ilo_miss_limit": 2,
     },
+    "ml350-gen9-p100": {
+        "product": "ProLiant ML350 Gen9",
+        "gpu": "P100",
+        "gpu_pci": "00000000:0a:00.0",
+        # 560SFP+ (bus 4), BCM5719 quad NIC (bus 2), P440ar (bus 3).
+        "native_buses": (4, 2, 3),
+        "ilo_sensor": "27-PCI 3",
+        # This BMC answers in-band IPMI slowly while the fans are ramped; 5 s and
+        # 2 misses stopped the publisher mid-benchmark on 2026-11-24.
+        "ilo_timeout_s": 15,
+        "ilo_miss_limit": 6,
+    },
 }
 PROFILE_NAME = os.environ.get("OCSD_PROFILE", "dl380-gen9-t4")
 if PROFILE_NAME not in PROFILES:

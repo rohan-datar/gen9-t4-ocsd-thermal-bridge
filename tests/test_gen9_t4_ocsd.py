@@ -389,6 +389,10 @@ class DL380ProtocolTests(ProtocolTests, ProfileCase):
     PROFILE = "dl380-gen9-t4"
 
 
+class ML350ProtocolTests(ProtocolTests, ProfileCase):
+    PROFILE = "ml350-gen9-p100"
+
+
 class ProfileSelectionTests(unittest.TestCase):
     def tearDown(self):
         load_default()
@@ -402,7 +406,14 @@ class ProfileSelectionTests(unittest.TestCase):
         self.assertEqual(ocsd.ILO_SENSOR, "21-PCI 1")
         self.assertEqual((ocsd.ILO_TIMEOUT_S, ocsd.ILO_MISS_LIMIT), (5, 2))
 
-
+    def test_ml350_p100_profile(self):
+        load_profile("ml350-gen9-p100")
+        self.assertEqual(ocsd.EXPECTED_PRODUCT, "ProLiant ML350 Gen9")
+        self.assertEqual((ocsd.GPU_PCI, ocsd.BUS, ocsd.DEVICE), ("00000000:0a:00.0", 10, 0))
+        self.assertEqual(ocsd.NATIVE_BUSES, (4, 2, 3))
+        self.assertEqual((ocsd.NATIVE_COUNT, ocsd.OWNED_COUNT, ocsd.RECORD_OFFSET), (3, 4, 544))
+        self.assertEqual(ocsd.ILO_SENSOR, "27-PCI 3")
+        self.assertEqual((ocsd.ILO_TIMEOUT_S, ocsd.ILO_MISS_LIMIT), (15, 6))
 
     def test_sensor_name_can_be_overridden(self):
         load_profile("dl380-gen9-t4", OCSD_ILO_SENSOR="22-PCI 2")
