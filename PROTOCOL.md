@@ -1,35 +1,64 @@
-# Observed OCSD Layout
+# OCSD layout
 
-This is a record of observations from one HPE DL380 Gen9 with stock iLO 4
-v2.82, not an HPE specification. The code is deliberately strict about this
-layout and should reject a different one instead of guessing.
+What is written here was observed on the tested platforms with stock iLO 4
+v2.82. It is not an HPE specification. The code accepts only this layout and
+rejects anything else rather than guessing.
 
-- SMBIOS type 229 contains one `$OCS` descriptor identifying a page-aligned
-  16 KiB physical-memory allocation. The publisher discovers its address at
-  runtime; no physical address is embedded in the release.
-- A 64-byte header precedes 160-byte option-card records. The implementation
-  requires header version marker 2, allocation size `0x4000`, record size
-  160, marker 102, and interval marker 5, plus its observed checksum rule.
-- The tested allocation had two valid native records and an empty third
-  record. The publisher uses only record index 2 and changes the header count
-  from 2 to 3 while it owns that slot. It refuses to overwrite a nonempty
-  or unrecognized record.
-- The published record identifies the tested T4 at PCI bus 5/device 0. Its
-  temperature byte is at record offset 84 and its 16-bit update counter at
-  offset 88. Header, device, and sensor checksums are checked or recomputed
-  as required by the observed layout.
-- iLO exposed the record as `21-PCI 1`. On this chassis that reading tracked
-  the source GPU temperature with an approximately +15 C display offset.
-  Neither the sensor label nor offset is guaranteed elsewhere.
+## Allocation
 
-The publisher's counter advances while running, including during shutdown
-cool-down. A stopped publisher or stale count can change iLO's fan response;
-on the tested chassis stale data drove the fans to 100%. That behavior is a
-single-platform observation, not a recovery guarantee for other firmware.
-The counter is 16-bit and wraps after 65,536 updates. The public code handles
-that arithmetic, but iLO's behavior at rollover has not been live-tested.
+SMBIOS type 229 contains one `$OCS` descriptor giving the physical address
+and size of a page-aligned 16 KiB allocation. The daemon reads the address at
+run time from `/sys/firmware/dmi/entries`; no address is built in.
 
-The synthetic unit-test fixture constructs only the fields needed to test
-these checks. It is not a dump of host memory and cannot prove another
-machine has the same layout. Before any live write, inspect and privately
-back up the target machine's allocation, then stop on every mismatch.
+## Header (64 bytes)
+
+| Offset | Size | Value |
+|---|---|---|
+| 0 | 1 | version, `2` |
+| 4 | 2 | allocation size, `0x4000` |
+| 8 | 1 | card capacity marker, `102` |
+| 12 | 1 | record size, `160` |
+| 16 | 4 | physical address of the first record (allocation + 64) |
+| 32 | 1 | polling interval marker, `5` |
+| 56 | 1 | number of populated records |
+| 60 | 4 | checksum: the two's-complement negation of the sum of the fields above |
+
+## Records (160 bytes each)
+
+The firmware fills the first records with the server's own option cards. Each
+native record starts with a 64-byte device header: byte 0 is `1`, byte 4 the
+PCI bus, byte 8 the device, and the sixteen 32-bit words sum to zero.
+
+| Profile | Native records (PCI bus) | GPU record | Count while published |
+|---|---|---|---|
+| `dl380-gen9-t4` | 2: bus 2, bus 3 | index 2, bus 5 / device 0 | 2 -> 3 |
+| `ml350-gen9-p100` | 3: bus 4 (560SFP+), bus 2 (BCM5719), bus 3 (P440ar) | index 3, bus 10 / device 0 | 3 -> 4 |
+
+The daemon checks every native record's bus and checksum, requires the record
+after them to be completely empty, and refuses to write if anything differs.
+In the GPU record, the temperature is the byte at offset 84 and a 16-bit
+update counter is at offset 88; the device and sensor checksums are
+recomputed on every update.
+
+## iLO's view
+
+iLO shows the record as a PCI temperature sensor and reads it at its own
+polling interval:
+
+| Profile | Sensor | iLO reading vs. published value |
+|---|---|---|
+| `dl380-gen9-t4` | `21-PCI 1` | about +15 C |
+| `ml350-gen9-p100` | `27-PCI 3` | +15 C |
+
+On the ML350, iLO showed the sensor only after an iLO reset while the daemon
+was publishing, and again after every host power cycle. The DL380 notes say
+it may need one as well. On both, stale data (the counter no longer
+advancing) drove the fans to 100%. The 16-bit counter wraps after 65,536 updates; one
+natural wrap was observed on the DL380 without any change in iLO's behavior.
+
+## Tests
+
+The synthetic tables in `tests/` contain only the fields needed to exercise
+these checks. They are not host memory dumps and cannot show that another
+machine shares this layout. Before any live write, read and privately back up
+the target machine's allocation and compare it field by field.

@@ -45,7 +45,8 @@ A marker count of zero is not proof that OCSD is absent. A positive marker count
 is not proof that the Gen9 record layout exists. We have not established Gen8
 record size, checksum rules, ownership, thermal behavior, or safe slots.
 
-Never run the Gen9 publisher unchanged on another chassis. Do not post raw
+Never run the publisher on a chassis without its own profile; see
+[adding-a-platform.md](adding-a-platform.md). Do not post raw
 physical-memory dumps. For Gen8 investigations, open an issue with the
 sanitized output plus separately confirmed chassis, firmware, cooling
 configuration and test conditions. No read-only report authorizes a write.

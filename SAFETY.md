@@ -1,64 +1,67 @@
-# Safety And Recovery
+# Safety and recovery
 
-This code writes a reverse-engineered OCSD record in physical memory as root.
-It has been demonstrated on one specific DL380 Gen9, not certified by HPE.
-Use it only if you can recover the machine locally and accept the risk of
-management-controller misbehavior or inadequate cooling.
+This code writes a reverse-engineered record into physical memory as root.
+It has been demonstrated on the platforms listed in the README, not certified
+by HPE. Use it only if you can recover the machine locally and accept the
+risk of management-controller misbehavior or inadequate cooling.
 
-## Before Any Write
+## Before the first write
 
-- Keep stock iLO firmware and the complete, correct physical air path.
-- Verify the exact product, GPU identity, sensor mapping, firmware, and fan
-  hardware; do not infer compatibility from the Gen9 label alone.
-- Confirm that a unique SMBIOS type-229 OCSD allocation exists, its header and
-  native records validate, record 2 is empty, and no other publisher owns it.
-- Preserve the original OCSD state in a **private** rollback location. Raw
-  physical-memory snapshots do not belong in a public issue or repository.
-- Arrange an operator-controlled maintenance window, console access, and a
-  known way to stop GPU work. A remote-only recovery plan is insufficient.
-- Configure real systemd GPU workload services; a missing or wrong unit means
-  the thermal-stop action may not stop the workload.
+- Keep stock iLO firmware and the complete, correct air path: fans, baffles,
+  blanking panels.
+- Check the exact product, GPU PCI location, firmware and fan hardware against
+  the profile. A "Gen9" label alone says nothing about compatibility.
+- Confirm there is one SMBIOS type-229 OCSD allocation, that its header and
+  native records match the profile, that the GPU record slot is empty, and
+  that nothing else is publishing.
+- Save the original allocation somewhere **private**. Raw physical-memory
+  contents never belong in an issue or repository.
+- Plan a maintenance window with console access and a known way to stop the
+  GPU work. A remote-only recovery plan is not enough.
+- Configure the real GPU workload services. A missing or wrong unit means the
+  thermal stop does nothing.
 
-## Runtime Invariants
+## What the daemon guarantees, and what it does not
 
-The publisher writes only its claimed record and the device-count header.
-It verifies writes, validates ownership on restart, and refuses to reclaim an
-unknown record. If GPU telemetry fails it attempts to publish 85 C and
-requests the configured workloads stop. At 82 C it requests a stop. If iLO
-stops tracking the sensor, it requests a stop and fails. Its systemd watchdog
-is intended to restart a stalled publisher before iLO treats updates as stale.
+The daemon writes only its own record and the header's count. It verifies
+each write, checks ownership on restart, and never takes over a record it did
+not create. If GPU telemetry fails it publishes 85 C and asks the workloads to
+stop; at 82 C it asks them to stop; if iLO stops tracking the sensor it asks
+them to stop and exits. Run it under a systemd watchdog so a hung publisher is
+restarted before iLO treats the data as stale.
 
-These are risk reductions, **not guarantees**. In the tested chassis, stale
-OCSD data caused iLO to drive fans to 100%, but other firmware may behave
-differently. Monitor the actual GPU and fan telemetry; do not rely only on the
-service's `active` state.
-The 16-bit update counter wraps after approximately 18 hours at one update
-per second; live iLO behavior at rollover remains unqualified.
+These reduce risk; they are **not** guarantees. On both tested chassis stale
+data made iLO run the fans at 100%, but other firmware may differ. Watch the
+real GPU and fan readings rather than the service state.
 
-## Stop And Rollback
+## Stopping and rollback
 
-Stopping the publisher asks configured GPU workloads to stop, continues to
-publish during cool-down, then restores the original header and empty slot
-only after three cool samples at or below 55 C. If the GPU stays hot, sensor
-data is lost, ownership changes, or restoration cannot be verified, it leaves
-the OCSD record in place rather than blindly writing over an unknown state.
-That failure requires operator attention and a documented maintenance
-recovery; do not issue ad hoc `/dev/mem` writes.
+On stop, the daemon asks the workloads to stop and keeps publishing while the
+GPU cools. Only after three readings at or below 55 C does it restore the
+original header and empty record. If the GPU stays hot for 90 seconds,
+telemetry is lost, ownership has changed or the restore cannot be verified,
+it leaves its record in place rather than write over an unknown state. That
+needs an operator and a planned recovery; do not improvise `/dev/mem` writes.
 
-The registration helper is manual. Without `--allow-ilo-reset` it only checks
-registration. An operator may invoke it with that flag after independently
-verifying all GPU activity is idle.
-It then checks the configured workload units are loaded and inactive, takes
-three cool GPU samples, and checks that the publisher record exists and the
-sensor is absent before resetting
-**iLO only**. It cannot detect unconfigured GPU processes. iLO reset
-interrupts management access; never perform it without an independent
-recovery path.
+## Resetting iLO
 
-The example publisher unit has no boot-enable section. It is not an unattended
-thermal safeguard: iLO may require an operator-approved reset to discover the
-sensor, and systemd startup times out without registration. Keep GPU workloads
-stopped until sensor and fan response are verified. Complete manual start,
-load, telemetry-loss, restart, stop, and restoration checks on your own
-hardware before considering any boot automation. Do not attempt a manual iLO
-registration reset without a maintenance window and independent recovery path.
+The registration helper only checks registration unless run with
+`--allow-ilo-reset`. With it, the helper first checks that the configured
+workload services are loaded and inactive, takes three cool GPU readings, and
+confirms the daemon's record exists and the sensor is missing; then it resets
+**iLO only**. It cannot see GPU processes outside those services. A reset
+interrupts management access, so do it only with an independent way back in.
+
+## Starting at boot
+
+The example unit in `examples/systemd` has no `[Install]` section: start it
+by hand until you have tested manual start, load, telemetry loss, restart,
+stop and restore on your own hardware. After a power cycle iLO may need a
+reset before it shows the sensor, so boot automation still needs someone, or
+a tested procedure, to complete registration. Keep GPU work stopped until the
+sensor and fan response are confirmed.
+
+The NixOS module does start the daemon at boot. That was chosen for the
+`ml350-gen9-p100` platform after the testing in
+[docs/platforms/ml350-gen9-p100.md](docs/platforms/ml350-gen9-p100.md), with
+an iLO reset done by hand after each power cycle.
