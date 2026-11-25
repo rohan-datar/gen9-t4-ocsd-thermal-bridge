@@ -5,7 +5,7 @@
 # Author: Josh Murphy
 # Company: Ocean Media Now (https://www.oceanmedianow.com)
 # Architecture: NVIDIA telemetry -> OCSD -> stock iLO 4 -> HPE fan control.
-"""Check T4 OCSD registration; iLO reset requires explicit opt-in."""
+"""Check the GPU OCSD sensor registration; iLO reset requires explicit opt-in."""
 
 import argparse
 import logging
@@ -18,13 +18,14 @@ import gen9_t4_ocsd as ocsd
 
 
 LOG = logging.getLogger("gen9-t4-ocsd-register")
+ILOREST = os.environ.get("OCSD_ILOREST", "/usr/sbin/ilorest")
 
 
 def publisher_record_present():
     if not ocsd.STATE.is_file():
         return False
     process = subprocess.check_output(
-        ["/usr/bin/systemctl", "show", "-P", "MainPID", "gen9-t4-ocsd.service"],
+        [ocsd.SYSTEMCTL, "show", "-P", "MainPID", "gen9-t4-ocsd.service"],
         timeout=5).decode("ascii").strip()
     if not process.isdigit() or int(process) <= 0:
         return False
@@ -37,7 +38,7 @@ def publisher_record_present():
             record = bytes(memory[ocsd.RECORD_OFFSET:
                                   ocsd.RECORD_OFFSET + ocsd.RECORD_SIZE])
             ocsd.validate_header(header, address)
-            return header[56] == 3 and ocsd.owned_record(record)
+            return header[56] == ocsd.OWNED_COUNT and ocsd.owned_record(record)
         finally:
             memory.close()
     finally:
@@ -48,7 +49,7 @@ def sensor_matches_gpu():
     try:
         reading = ocsd.ilo_temperature()
         gpu = ocsd.gpu_temperature()
-        return reading is not None and abs(reading - (gpu + 15)) <= 6
+        return reading is not None and abs(reading - (gpu + ocsd.ILO_OFFSET_C)) <= 6
     except Exception:
         return False
 
@@ -60,12 +61,12 @@ def main(allow_ilo_reset=False):
             break
         time.sleep(2)
     else:
-        raise RuntimeError("T4 publisher did not claim OCSD slot")
+        raise RuntimeError("%s publisher did not claim OCSD slot" % ocsd.GPU_NAME)
     if sensor_matches_gpu():
-        LOG.info("iLO already tracks T4; management reset unnecessary")
+        LOG.info("iLO already tracks %s; management reset unnecessary", ocsd.GPU_NAME)
         return
     if not allow_ilo_reset:
-        raise RuntimeError("T4 sensor absent; iLO reset requires --allow-ilo-reset")
+        raise RuntimeError("%s sensor absent; iLO reset requires --allow-ilo-reset" % ocsd.GPU_NAME)
     ocsd.validate_workload_units()
     if ocsd.workloads_active():
         raise RuntimeError("configured GPU workload is active; iLO reset deferred")
@@ -73,16 +74,16 @@ def main(allow_ilo_reset=False):
         if ocsd.gpu_temperature() > ocsd.RESTORE_COOL_C:
             raise RuntimeError("GPU is not cool; iLO reset deferred")
         time.sleep(1)
-    LOG.warning("T4 sensor absent; resetting iLO management processor")
-    subprocess.run(["/usr/sbin/ilorest", "iloreset"], timeout=20, check=True,
+    LOG.warning("%s sensor absent; resetting iLO management processor", ocsd.GPU_NAME)
+    subprocess.run([ILOREST, "iloreset"], timeout=20, check=True,
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     deadline = time.monotonic() + 105
     while time.monotonic() < deadline:
         if sensor_matches_gpu():
-            LOG.info("iLO registered T4 OCSD sensor")
+            LOG.info("iLO registered %s OCSD sensor", ocsd.GPU_NAME)
             return
         time.sleep(5)
-    raise RuntimeError("iLO reset completed but T4 sensor did not register")
+    raise RuntimeError("iLO reset completed but %s sensor did not register" % ocsd.GPU_NAME)
 
 
 if __name__ == "__main__":
@@ -94,5 +95,5 @@ if __name__ == "__main__":
     try:
         main(args.allow_ilo_reset)
     except Exception:
-        LOG.exception("T4 sensor registration failed")
+        LOG.exception("%s sensor registration failed", ocsd.GPU_NAME)
         raise SystemExit(1)

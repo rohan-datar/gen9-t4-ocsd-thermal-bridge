@@ -1,3 +1,6 @@
+import importlib
+import json
+import os
 import sys
 from pathlib import Path
 import struct
@@ -11,6 +14,35 @@ import gen9_t4_ocsd as ocsd
 import gen9_t4_ocsd_register as register
 
 
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
+
+
+def load_profile(name, **env):
+    """Re-import the daemon under OCSD_PROFILE=name (plus any extra env)."""
+    values = {"OCSD_PROFILE": name, **env}
+    with mock.patch.dict(os.environ, values):
+        importlib.reload(ocsd)
+
+
+def load_default():
+    with mock.patch.dict(os.environ, {}, clear=False):
+        for key in ("OCSD_PROFILE", "OCSD_ILO_SENSOR", "OCSD_PUBLISH_OFFSET_C", "OCSD_ILO_OFFSET_C"):
+            os.environ.pop(key, None)
+        importlib.reload(ocsd)
+
+
+class ProfileCase(unittest.TestCase):
+    PROFILE = "dl380-gen9-t4"
+
+    @classmethod
+    def setUpClass(cls):
+        load_profile(cls.PROFILE)
+
+    @classmethod
+    def tearDownClass(cls):
+        load_default()
+
+
 def synthetic_snapshot(address):
     memory = bytearray(0x4000)
     header = bytearray(64)
@@ -20,10 +52,10 @@ def synthetic_snapshot(address):
     header[12] = ocsd.RECORD_SIZE
     struct.pack_into("<I", header, 16, address + 64)
     header[32] = 5
-    header[56] = 2
+    header[56] = ocsd.NATIVE_COUNT
     struct.pack_into("<I", header, 60, ocsd.checksum_header(header))
     memory[:64] = header
-    for index, bus in enumerate((2, 3)):
+    for index, bus in enumerate(ocsd.NATIVE_BUSES):
         native = bytearray(64)
         native[0] = 1
         native[4] = bus
@@ -34,7 +66,9 @@ def synthetic_snapshot(address):
     return bytes(memory)
 
 
-class OcsdProtocolTests(unittest.TestCase):
+class ProtocolTests:
+    """Protocol suite, run once per profile by the subclasses below."""
+
     def setUp(self):
         self.address = 0x70000000
         self.snapshot = synthetic_snapshot(self.address)
@@ -43,7 +77,7 @@ class OcsdProtocolTests(unittest.TestCase):
         self.assertEqual(len(self.snapshot), 0x4000)
         ocsd.validate_header(self.snapshot[:64], self.address)
         ocsd.validate_native_headers(self.snapshot)
-        self.assertEqual(self.snapshot[56], 2)
+        self.assertEqual(self.snapshot[56], ocsd.NATIVE_COUNT)
         self.assertFalse(any(self.snapshot[ocsd.RECORD_OFFSET:
                                            ocsd.RECORD_OFFSET + ocsd.RECORD_SIZE]))
 
@@ -55,9 +89,9 @@ class OcsdProtocolTests(unittest.TestCase):
 
     def test_header_rejects_corruption(self):
         header = self.snapshot[:64]
-        enabled = ocsd.header_with_count(header, 3)
+        enabled = ocsd.header_with_count(header, ocsd.OWNED_COUNT)
         ocsd.validate_header(enabled, self.address)
-        self.assertEqual(ocsd.header_with_count(enabled, 2), header)
+        self.assertEqual(ocsd.header_with_count(enabled, ocsd.NATIVE_COUNT), header)
         corrupt = bytearray(enabled)
         corrupt[16] ^= 1
         with self.assertRaises(ValueError):
@@ -217,7 +251,7 @@ class OcsdProtocolTests(unittest.TestCase):
                 mock.patch.object(ocsd, "gpu_temperature", side_effect=RuntimeError("NVML")), \
                 mock.patch.object(ocsd, "stop_workloads", side_effect=inspect_stop):
             ocsd.claim(memory, self.address)
-        self.assertEqual(observed, [(3, 85, True)])
+        self.assertEqual(observed, [(ocsd.OWNED_COUNT, 85, True)])
 
     def test_claim_write_failure_still_requests_workload_stop(self):
         class FailingMemory(bytearray):
@@ -242,7 +276,7 @@ class OcsdProtocolTests(unittest.TestCase):
 
     def test_update_publishes_fail_high_before_failed_status_check(self):
         memory = bytearray(self.snapshot)
-        active = ocsd.header_with_count(memory[:64], 3)
+        active = ocsd.header_with_count(memory[:64], ocsd.OWNED_COUNT)
         memory[:64] = active
         observed = []
 
@@ -262,7 +296,7 @@ class OcsdProtocolTests(unittest.TestCase):
 
     def test_update_counter_wraps_in_synthetic_record(self):
         memory = bytearray(self.snapshot)
-        active = ocsd.header_with_count(memory[:64], 3)
+        active = ocsd.header_with_count(memory[:64], ocsd.OWNED_COUNT)
         memory[:64] = active
         counter, warning = ocsd.publish_and_guard(
             memory, active, 65535, 45, False, False)
@@ -274,7 +308,7 @@ class OcsdProtocolTests(unittest.TestCase):
 
     def test_update_header_mismatch_requests_workload_stop(self):
         memory = bytearray(self.snapshot)
-        active = ocsd.header_with_count(memory[:64], 3)
+        active = ocsd.header_with_count(memory[:64], ocsd.OWNED_COUNT)
         memory[:64] = active
         with mock.patch.object(ocsd, "stop_workloads", return_value=False) as stop:
             with self.assertRaisesRegex(RuntimeError, "header changed"):
@@ -295,7 +329,7 @@ class OcsdProtocolTests(unittest.TestCase):
                     ocsd, "boot_id", return_value="boot-one"):
                 original, active, counter = ocsd.claim(memory, self.address)
                 self.assertEqual(counter, 1)
-                self.assertEqual(memory[56], 3)
+                self.assertEqual(memory[56], ocsd.OWNED_COUNT)
                 original, active, counter = ocsd.claim(memory, self.address)
                 self.assertEqual(counter, 2)
             with mock.patch.object(ocsd, "STATE", state), mock.patch.object(
@@ -345,10 +379,98 @@ class OcsdProtocolTests(unittest.TestCase):
                     ocsd.time, "sleep", return_value=None):
                 with self.assertRaisesRegex(RuntimeError, "retaining OCSD sensor"):
                     ocsd.restore(memory, original, active)
-            self.assertEqual(memory[56], 3)
+            self.assertEqual(memory[56], ocsd.OWNED_COUNT)
             self.assertTrue(ocsd.owned_record(memory[ocsd.RECORD_OFFSET:
                                                       ocsd.RECORD_OFFSET + ocsd.RECORD_SIZE]))
             self.assertTrue(state.exists())
+
+
+class DL380ProtocolTests(ProtocolTests, ProfileCase):
+    PROFILE = "dl380-gen9-t4"
+
+
+class ProfileSelectionTests(unittest.TestCase):
+    def tearDown(self):
+        load_default()
+
+    def test_default_is_the_original_dl380_t4(self):
+        load_default()
+        self.assertEqual(ocsd.PROFILE_NAME, "dl380-gen9-t4")
+        self.assertEqual(ocsd.EXPECTED_PRODUCT, "ProLiant DL380 Gen9")
+        self.assertEqual((ocsd.GPU_PCI, ocsd.BUS, ocsd.DEVICE), ("00000000:05:00.0", 5, 0))
+        self.assertEqual((ocsd.NATIVE_COUNT, ocsd.OWNED_COUNT, ocsd.RECORD_OFFSET), (2, 3, 384))
+        self.assertEqual(ocsd.ILO_SENSOR, "21-PCI 1")
+        self.assertEqual((ocsd.ILO_TIMEOUT_S, ocsd.ILO_MISS_LIMIT), (5, 2))
+
+
+
+    def test_sensor_name_can_be_overridden(self):
+        load_profile("dl380-gen9-t4", OCSD_ILO_SENSOR="22-PCI 2")
+        self.assertEqual(ocsd.ILO_SENSOR, "22-PCI 2")
+
+    def test_unknown_profile_is_rejected(self):
+        with mock.patch.dict(os.environ, {"OCSD_PROFILE": "dl360-gen9-a2"}):
+            with self.assertRaisesRegex(ValueError, "unknown OCSD_PROFILE"):
+                importlib.reload(ocsd)
+
+    def test_profile_is_checked_against_dmi(self):
+        load_profile("dl380-gen9-t4")
+        with mock.patch.object(ocsd.Path, "read_text", return_value="ProLiant ML350 Gen9\n"):
+            with self.assertRaisesRegex(ValueError, "is not a ProLiant DL380 Gen9"):
+                ocsd.run()
+
+
+class UpstreamCompatibilityTests(ProfileCase):
+    """The default profile must behave byte-for-byte like upstream 1c65a38."""
+
+    PROFILE = "dl380-gen9-t4"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.fixture = json.loads((FIXTURES / "upstream-1c65a38.json").read_text())
+
+    def test_constants_match(self):
+        constants = self.fixture["constants"]
+        self.assertEqual(ocsd.EXPECTED_PRODUCT, constants["EXPECTED_PRODUCT"])
+        self.assertEqual(ocsd.GPU_PCI, constants["GPU_PCI"])
+        self.assertEqual((ocsd.BUS, ocsd.DEVICE), (constants["BUS"], constants["DEVICE"]))
+        self.assertEqual(ocsd.RECORD_OFFSET, constants["RECORD_OFFSET"])
+        self.assertEqual(list(ocsd.NATIVE_BUSES), self.fixture["native_buses"])
+
+    def test_records_match(self):
+        for key, expected in self.fixture["records"].items():
+            temperature, counter = map(int, key.split(":"))
+            with self.subTest(temperature=temperature, counter=counter):
+                self.assertEqual(ocsd.make_record(temperature, counter).hex(), expected)
+
+    def test_headers_match(self):
+        snapshot = synthetic_snapshot(self.fixture["address"])
+        self.assertEqual(snapshot[:64].hex(), self.fixture["snapshot_header"])
+        self.assertEqual(ocsd.header_with_count(snapshot[:64], ocsd.OWNED_COUNT).hex(),
+                         self.fixture["owned_header"])
+
+    def test_claim_and_restore_match(self):
+        address = self.fixture["address"]
+        snapshot = synthetic_snapshot(address)
+        memory = bytearray(snapshot)
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(ocsd, "STATE", Path(directory) / "ownership.json"), \
+                mock.patch.object(ocsd, "boot_id", return_value="boot-one"), \
+                mock.patch.object(ocsd, "gpu_temperature", return_value=45):
+            original, active, counter = ocsd.claim(memory, address)
+            claim = self.fixture["claim"]
+            self.assertEqual(counter, claim["counter"])
+            self.assertEqual(bytes(memory[:64]).hex(), claim["header"])
+            self.assertEqual(bytes(memory[ocsd.RECORD_OFFSET:
+                                          ocsd.RECORD_OFFSET + ocsd.RECORD_SIZE]).hex(),
+                             claim["record"])
+            self.assertEqual(json.loads(ocsd.STATE.read_text()), claim["state"])
+            with mock.patch.object(ocsd, "workloads_active", return_value=False), \
+                    mock.patch.object(ocsd.time, "sleep", return_value=None):
+                ocsd.restore(memory, original, active)
+        self.assertTrue(self.fixture["restored_equals_snapshot"])
+        self.assertEqual(bytes(memory), snapshot)
 
 
 if __name__ == "__main__":

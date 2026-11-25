@@ -1,3 +1,5 @@
 # Install as /etc/gen9-t4-ocsd.conf, owned by root and mode 0600.
+# Platform profile, one of PROFILES in gen9_t4_ocsd.py. See README.md.
+OCSD_PROFILE="dl380-gen9-t4"
 # List every systemd service that can keep this GPU busy. Replace these names.
 OCSD_WORKLOAD_UNITS="example-inference.service example-transcription.service"

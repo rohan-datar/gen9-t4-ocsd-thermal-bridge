@@ -5,7 +5,7 @@
 # Author: Josh Murphy
 # Company: Ocean Media Now (https://www.oceanmedianow.com)
 # Architecture: NVIDIA telemetry -> OCSD -> stock iLO 4 -> HPE fan control.
-"""Publish the Gen9 T4 temperature through the firmware OCSD option-card slot."""
+"""Publish an NVIDIA GPU temperature through the HPE Gen9 firmware OCSD option-card slot."""
 
 import fcntl
 import json
@@ -25,11 +25,49 @@ LOG = logging.getLogger("gen9-t4-ocsd")
 STATE = Path("/var/lib/gen9-t4-ocsd/ownership.json")
 LOCK = "/run/gen9-t4-ocsd/publisher.lock"
 DMI_ENTRIES = Path("/sys/firmware/dmi/entries")
-EXPECTED_PRODUCT = "ProLiant DL380 Gen9"
-GPU_PCI = "00000000:05:00.0"
-BUS, DEVICE = 5, 0
+# Qualified platforms. A profile pins the chassis (DMI product name), the GPU's
+# PCI address, the native OCSD records the firmware stages ahead of ours (by PCI
+# bus, in table order), the iLO sensor that shows our record, and the iLO-check
+# tolerance the platform needed. Select one with OCSD_PROFILE. The default is
+# the original DL380 Gen9 + T4 configuration, unchanged.
+PROFILES = {
+    "dl380-gen9-t4": {
+        "product": "ProLiant DL380 Gen9",
+        "gpu": "T4",
+        "gpu_pci": "00000000:05:00.0",
+        "native_buses": (2, 3),
+        "ilo_sensor": "21-PCI 1",
+        "ilo_timeout_s": 5,
+        "ilo_miss_limit": 2,
+    },
+}
+PROFILE_NAME = os.environ.get("OCSD_PROFILE", "dl380-gen9-t4")
+if PROFILE_NAME not in PROFILES:
+    raise ValueError("unknown OCSD_PROFILE %r; expected one of: %s"
+                     % (PROFILE_NAME, ", ".join(sorted(PROFILES))))
+PROFILE = PROFILES[PROFILE_NAME]
+EXPECTED_PRODUCT = PROFILE["product"]
+GPU_NAME = PROFILE["gpu"]
+GPU_PCI = PROFILE["gpu_pci"]
+BUS = int(GPU_PCI.split(":")[1], 16)
+DEVICE = int(GPU_PCI.split(":")[2].split(".")[0], 16)
 RECORD_SIZE = 160
-RECORD_OFFSET = 64 + 2 * RECORD_SIZE
+# The publisher claims the first empty record after the native ones and holds
+# the header count at NATIVE_COUNT + 1 while it owns the slot.
+NATIVE_BUSES = PROFILE["native_buses"]
+NATIVE_COUNT = len(NATIVE_BUSES)
+OWNED_COUNT = NATIVE_COUNT + 1
+RECORD_INDEX = NATIVE_COUNT
+RECORD_OFFSET = 64 + RECORD_INDEX * RECORD_SIZE
+ILO_TIMEOUT_S = PROFILE["ilo_timeout_s"]
+ILO_MISS_LIMIT = PROFILE["ilo_miss_limit"]
+# Executable paths are overridable so non-FHS hosts (NixOS) can supply store
+# paths. OCSD_ILO_SENSOR overrides the profile's sensor name.
+NVIDIA_SMI = os.environ.get("OCSD_NVIDIA_SMI", "/usr/bin/nvidia-smi")
+IPMITOOL = os.environ.get("OCSD_IPMITOOL", "/usr/bin/ipmitool")
+SYSTEMCTL = os.environ.get("OCSD_SYSTEMCTL", "/usr/bin/systemctl")
+ILO_SENSOR = os.environ.get("OCSD_ILO_SENSOR", PROFILE["ilo_sensor"])
+ILO_OFFSET_C = int(os.environ.get("OCSD_ILO_OFFSET_C", "15"))
 CAUTION_C = 85
 CONTINUOUS_C = 75
 STOP_WORKLOAD_C = 82
@@ -59,14 +97,14 @@ def validate_header(header, address):
         raise ValueError("unexpected OCSD allocation size")
     if header[12] != RECORD_SIZE or struct.unpack_from("<I", header, 16)[0] != address + 64:
         raise ValueError("unexpected OCSD record layout")
-    if header[32] != 5 or header[56] not in (2, 3):
+    if header[32] != 5 or header[56] not in (NATIVE_COUNT, OWNED_COUNT):
         raise ValueError("unexpected OCSD polling interval or device count")
     if struct.unpack_from("<I", header, 60)[0] != checksum_header(header):
         raise ValueError("invalid OCSD header checksum")
 
 
 def validate_native_headers(memory):
-    for index, bus in enumerate((2, 3)):
+    for index, bus in enumerate(NATIVE_BUSES):
         head = bytes(memory[64 + index * RECORD_SIZE:128 + index * RECORD_SIZE])
         words = struct.unpack("<16I", head)
         if head[0] != 1 or head[4] != bus or head[8] != 0 or sum(words) & 0xffffffff:
@@ -135,7 +173,7 @@ def owned_record(record):
 
 def gpu_temperature():
     output = subprocess.check_output(
-        ["/usr/bin/nvidia-smi", "--id=" + GPU_PCI,
+        [NVIDIA_SMI, "--id=" + GPU_PCI,
          "--query-gpu=pci.bus_id,temperature.gpu", "--format=csv,noheader,nounits"],
         stderr=subprocess.DEVNULL, timeout=4).decode("ascii").strip().splitlines()
     if len(output) != 1:
@@ -151,8 +189,8 @@ def gpu_temperature():
 
 def ilo_temperature():
     output = subprocess.check_output(
-        ["/usr/bin/ipmitool", "sdr", "get", "21-PCI 1"],
-        stderr=subprocess.DEVNULL, timeout=5).decode("ascii", "replace")
+        [IPMITOOL, "sdr", "get", ILO_SENSOR],
+        stderr=subprocess.DEVNULL, timeout=ILO_TIMEOUT_S).decode("ascii", "replace")
     return parse_ilo_temperature(output)
 
 
@@ -178,7 +216,7 @@ def notify(message):
 def stop_workloads():
     try:
         result = subprocess.run(
-            ["/usr/bin/systemctl", "stop", "--no-block"] + list(WORKLOAD_UNITS),
+            [SYSTEMCTL, "stop", "--no-block"] + list(WORKLOAD_UNITS),
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5,
             check=False)
     except Exception as error:
@@ -192,7 +230,7 @@ def stop_workloads():
 
 def workloads_active():
     return any(
-        subprocess.run(["/usr/bin/systemctl", "is-active", "--quiet", unit],
+        subprocess.run([SYSTEMCTL, "is-active", "--quiet", unit],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                        timeout=5, check=False).returncode == 0
         for unit in WORKLOAD_UNITS
@@ -206,7 +244,7 @@ def validate_workload_units():
         if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.@:-]*\.service", unit):
             raise ValueError("invalid GPU workload service name")
         output = subprocess.check_output(
-            ["/usr/bin/systemctl", "show", "-P", "LoadState", unit],
+            [SYSTEMCTL, "show", "-P", "LoadState", unit],
             stderr=subprocess.DEVNULL, timeout=5).decode("ascii").strip()
         if output != "loaded":
             raise ValueError("configured GPU workload service is not loaded")
@@ -266,7 +304,7 @@ def claim(memory, address):
     record = bytes(memory[RECORD_OFFSET:RECORD_OFFSET + RECORD_SIZE])
     validate_header(current, address)
     validate_native_headers(memory)
-    if current[56] == 2 and not any(record):
+    if current[56] == NATIVE_COUNT and not any(record):
         if STATE.exists():
             state = json.loads(STATE.read_text("ascii"))
             if (state.get("address") != address or state.get("gpu_pci") != GPU_PCI
@@ -278,13 +316,13 @@ def claim(memory, address):
         save_state({"boot_id": boot_id(), "address": address,
                     "original_header": original.hex(), "gpu_pci": GPU_PCI})
         counter = 0
-    elif current[56] == 3 and owned_record(record) and STATE.is_file():
+    elif current[56] == OWNED_COUNT and owned_record(record) and STATE.is_file():
         state = json.loads(STATE.read_text("ascii"))
         original = bytes.fromhex(state["original_header"])
         validate_header(original, address)
         if (state["address"] != address or state["gpu_pci"] != GPU_PCI
-                or original[56] != 2
-                or header_with_count(original, 3) != current):
+                or original[56] != NATIVE_COUNT
+                or header_with_count(original, OWNED_COUNT) != current):
             raise ValueError("OCSD ownership state does not match this boot")
         if state["boot_id"] != boot_id():
             LOG.warning("recovering owned OCSD record after a new host boot")
@@ -293,7 +331,8 @@ def claim(memory, address):
         counter = struct.unpack_from("<H", record, 88)[0]
         LOG.warning("recovering owned OCSD record after interrupted publisher")
     else:
-        raise ValueError("OCSD slot 2 is not empty or safely recoverable")
+        raise ValueError(
+            f"OCSD slot {RECORD_INDEX} is not empty or safely recoverable")
     counter = (counter + 1) & 0xffff
     telemetry_failed = False
     try:
@@ -302,7 +341,7 @@ def claim(memory, address):
         LOG.error("initial NVIDIA telemetry failed: %s", type(error).__name__)
         temperature = CAUTION_C
         telemetry_failed = True
-    active_header = header_with_count(original, 3)
+    active_header = header_with_count(original, OWNED_COUNT)
     try:
         new_record = make_record(temperature, counter)
         memory[RECORD_OFFSET:RECORD_OFFSET + RECORD_SIZE] = new_record
@@ -364,13 +403,13 @@ def restore(memory, original, active_header):
     if bytes(memory[:64]) != original or any(memory[RECORD_OFFSET:RECORD_OFFSET + RECORD_SIZE]):
         raise RuntimeError("OCSD restoration readback failed")
     STATE.unlink()
-    LOG.info("original OCSD header and empty slot 2 restored")
+    LOG.info("original OCSD header and empty slot %d restored", RECORD_INDEX)
 
 
 def run():
     global STOP
     if Path("/sys/class/dmi/id/product_name").read_text().strip() != EXPECTED_PRODUCT:
-        raise ValueError("host is not the qualified DL380 Gen9")
+        raise ValueError("host is not a %s (OCSD_PROFILE=%s)" % (EXPECTED_PRODUCT, PROFILE_NAME))
     validate_workload_units()
     address = discover_ocsd()
     lock_fd = os.open(LOCK, os.O_CREAT | os.O_RDWR, 0o600)
@@ -383,7 +422,8 @@ def run():
         memory = mmap.mmap(fd, 0x4000, flags=mmap.MAP_SHARED,
                            prot=mmap.PROT_READ | mmap.PROT_WRITE, offset=address)
         original, active_header, counter = claim(memory, address)
-        LOG.info("T4 sensor published at OCSD record 2, physical 0x%x", address)
+        LOG.info("%s sensor published at OCSD record %d, physical 0x%x", GPU_NAME,
+                 RECORD_INDEX, address)
         ready_count = 0
         misses = 0
         ready = False
@@ -407,7 +447,7 @@ def run():
                 last_ilo_check = now
                 try:
                     ilo = ilo_temperature()
-                    match = ilo is not None and abs(ilo - (temperature + 15)) <= 6
+                    match = ilo is not None and abs(ilo - (temperature + ILO_OFFSET_C)) <= 6
                 except Exception as error:
                     if not ready:
                         LOG.warning("iLO sensor verification unavailable: %s", type(error).__name__)
@@ -415,12 +455,12 @@ def run():
                 ready_count = ready_count + 1 if match else 0
                 misses = 0 if match else misses + 1
                 if not ready and ready_count >= 2:
-                    notify("READY=1\nSTATUS=T4 OCSD sensor confirmed in iLO")
+                    notify("READY=1\nSTATUS=%s OCSD sensor confirmed in iLO" % GPU_NAME)
                     LOG.info("iLO PCI sensor confirmed; service ready")
                     ready = True
-                if ready and misses >= 2:
+                if ready and misses >= ILO_MISS_LIMIT:
                     stop_workloads()
-                    raise RuntimeError("iLO stopped tracking T4 OCSD temperature")
+                    raise RuntimeError("iLO stopped tracking %s OCSD temperature" % GPU_NAME)
             notify("WATCHDOG=1")
             if last_temp != temperature and temperature >= 70:
                 LOG.info("GPU temperature %d C", temperature)
@@ -449,5 +489,5 @@ if __name__ == "__main__":
     try:
         run()
     except Exception:
-        LOG.exception("OCSD T4 publisher stopped")
+        LOG.exception("OCSD %s publisher stopped", GPU_NAME)
         raise SystemExit(1)
